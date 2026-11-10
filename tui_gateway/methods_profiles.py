@@ -137,6 +137,7 @@ def _resurrect_recoverable_canonical(db, profile_path, session_id):
             return bool(wdb.unarchive_recoverable_session(session_id))
         finally:
             _best_effort(lambda: _lazy("hermes_state_registry", "release_or_close")(wdb))
+    
     except Exception:
         return False
 
@@ -447,6 +448,117 @@ def _(rid, params: dict) -> dict:
             return _ok(rid, {"found": True, "mime": mime, "size": len(blob),
                              "data": f"data:{mime};base64,{base64.b64encode(blob).decode('ascii')}"})
     return _ok(rid, {"found": False})
+
+
+def _mirror_secret(path, launch_home, name: str, wanted) -> bool:
+    """Copy the launch ``name`` file into the profile (0600) when it exists and ``wanted(src, dst)``."""
+    src, dst = launch_home / name, path / name
+    if not (src.is_file() and wanted(src, dst)):
+        return False
+    import shutil
+    shutil.copy2(src, dst)
+    with contextlib.suppress(OSError):
+        os.chmod(str(dst), 0o600)
+    return True
+
+
+def _env_has_content(env_path) -> bool:
+    lines = env_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    return any(s and not s.startswith("#") for s in map(str.strip, lines))
+
+
+def _mirror_voice_sections(path) -> bool:
+    """Copy stt/tts/voice sections from the launch profile (a fresh profile has only ``model``,
+    so voice fell back to defaults); True if written."""
+    try:
+        from hermes_cli.config import read_user_config_raw, save_config
+        # Launch file RAW too: the loaded config has ${VAR} refs expanded, and the new profile
+        # must get the ref (resolved against its own .env), never the launch profile's secret.
+        src_cfg = read_user_config_raw()
+        sections = {k: src_cfg[k] for k in ("stt", "tts", "voice") if src_cfg.get(k)}
+        if not sections:
+            return False
+        with _hermes_home_scope(path):
+            # RAW file: load_config() merges DEFAULT_CONFIG (every section would look present).
+            dst_cfg = read_user_config_raw() or {}
+            missing = {k: v for k, v in sections.items() if k not in dst_cfg}
+            if missing:
+                save_config({**dst_cfg, **missing})
+        return bool(missing)
+
+# health: allow BLE001 -- #82010 voice section mirroring boundary; catches malformed YAML from untrusted sources
+    except Exception:
+        return False
+
+
+def _inherit_launch_model(path) -> bool:
+    """Inherit launch model.provider/default when the new profile has none. Gate on the MODEL
+    SECTION, not config.yaml existing: voice mirroring creates the file first."""
+    # Gate on the MODEL SECTION being absent, not on config.yaml existing — earlier mirroring steps (voice
+    # sections, #85755) legitimately create the file first, and a file-existence gate silently skipped
+    # inheritance for every non-clone bot ("No inference provider configured" on first message, tester
+    # report). Clones bring their own model section and stay untouched.
+    from hermes_cli.config import load_config_readonly, read_user_config_raw
+    with _hermes_home_scope(path):
+        dst_model = (read_user_config_raw() or {}).get("model") or {}
+    if dst_model.get("provider") and dst_model.get("default"):
+        return False
+    launch_cfg = load_config_readonly() or {}
+    model_cfg = launch_cfg.get("model") or {}
+    if not (model_cfg.get("provider") and model_cfg.get("default")):
+        return False
+    # A custom endpoint travels with the model it backs (same seed as the CLI path). It is
+    # written BEFORE the pin: the pin validates the pick inside the new profile, and an empty profile
+    # rejects a provider it has not been told about ("Unknown provider").
+    # Seeded from the RAW launch file so a ${VAR} api_key travels as the ref, not its value.
+    seed = _lazy("hermes_cli.profile_model_seed", "launch_model_seed")(read_user_config_raw())
+    if seed.get("providers") or seed.get("custom_providers"):
+        from hermes_cli.config import save_config
+        merge = _lazy("hermes_cli.profile_model_seed", "merge_endpoint_seed")
+        with _hermes_home_scope(path):
+            save_config(merge(read_user_config_raw(), seed))
+    # Bare ``custom``/``local`` carries its endpoint into validation (the new profile's config names
+    # none); other providers ignore it. Validation needs the expanded URL, the profile keeps the
+    # launch file's spelling so a ${VAR} URL stays a ref.
+    _pin_profile_model(path, str(model_cfg["provider"]), str(model_cfg["default"]),
+                       str(model_cfg.get("base_url") or ""))
+    raw_url = ((read_user_config_raw() or {}).get("model") or {}).get("base_url")
+    if isinstance(raw_url, str) and "${" in raw_url:
+        from hermes_cli.config import save_config
+        with _hermes_home_scope(path):
+            cfg = read_user_config_raw() or {}
+            if isinstance(cfg.get("model"), dict) and cfg["model"].get("base_url") == model_cfg.get("base_url"):
+                cfg["model"]["base_url"] = raw_url
+                save_config(cfg)
+    return True
+
+
+def _mirror_launch_credentials(path, params: dict) -> dict:
+    """Copy launch .env / auth.json / voice sections into a new profile (best-effort per item).
+    ``share_auth`` reports ``auth: "shared"`` and skips the auth copy; ``mirror_credentials``
+    false skips everything. ``model_inherited`` is filled in by the caller."""
+    share_auth = is_truthy_value(params.get("share_auth", False))
+    mirrored = {"env": False, "auth": "shared" if share_auth else False, "model_inherited": False,
+                "voice": False}
+    if not is_truthy_value(params.get("mirror_credentials", True)):
+        return mirrored
+    launch_home = get_hermes_home()
+    # .env: only over the seeded comment-only stub (never a clone's secrets).
+    mirrored["env"] = _try(lambda: _mirror_secret(path, launch_home, ".env", lambda src, dst: (
+        _env_has_content(src) and not _try(lambda: _env_has_content(dst), False))), False)
+    if mirrored["env"] and not is_truthy_value(params.get("clone_channels", False)):
+        # Provider/tool keys are what "mirror credentials" means; the launch profile's bot tokens
+        # and allowlists would make the new bot collide with it over one Telegram/Discord bot.
+        _best_effort(lambda: _lazy("hermes_cli.profile_channels", "strip_channel_env_file")(path / ".env"))
+    if not share_auth:  # a copy forks token state: the first refresh in either store strands the other
+        mirrored["auth"] = _try(lambda: _mirror_secret(path, launch_home, "auth.json",
+                                                       lambda src, dst: not dst.exists()), False)
+        if mirrored["auth"]:
+            # Drop single-use OAuth grants (first refresh strands every sibling); they read from the
+            # root grant via the pool fallback. API keys stay.
+            _best_effort(lambda: _lazy("hermes_cli.auth", "strip_cloned_single_use_oauth_grants")(path))
+    mirrored["voice"] = _mirror_voice_sections(path)
+    return mirrored
 
 
 def _describe_toolsets(cfg):
